@@ -1,0 +1,766 @@
+---
+title: "Nationwide Modeling Exercise"
+author: "QIWEI MEN"
+date: "8/7/2020"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r}
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(naniar)
+library(finalfit)
+library(pROC)
+library(ggplot2)
+library(ROCR)
+library(randomForest)
+```
+
+## Problem Understanding
+  From the instruction of the project, we know that there are 79 variables drawn from two different databases A and B, and every group has been split into training set and testing set. The response value y was labeled 0 and 1, the purpose of this project is building two efficient models to predict the response y in the testing set.
+  
+  Based on this information, we can conclude that this is a typical classification problem of supervised machine learning. After checking my toolbox, my initial plan is building one logistic regression and one tree-based model (random forest or gradient boosting) and compare their performance.
+  
+
+## Data Checking 
+
+```{r}
+# set working directory
+setwd("C:/Users/Dain/Desktop/Nationwide Modeling Exercise")
+
+# import The data
+a_learn <- read.csv("featuresGroupAlearning.csv", header = TRUE, na.strings=c("","NA"))
+b_learn <- read.csv("featuresGroupBlearning.csv", header = TRUE, na.strings=c("","NA"))
+a_predict <- read.csv("featuresGroupAprediction.csv", header = TRUE, na.strings=c("","NA"))
+b_predict <- read.csv("featuresGroupBprediction.csv", header = TRUE, na.strings=c("","NA"))
+r_learn <- read.csv("responseLearning.csv", header = TRUE)
+```
+
+  Since the learning data was located in two datasets, we also need join the data firstly.
+
+```{r}
+## join tables
+learn <- a_learn %>%
+  inner_join(b_learn, by = "id") %>%
+  inner_join(r_learn, by = "id")
+```
+
+  Then take a look at the raw data.
+  
+```{r}
+str(learn)
+```
+
+  From the summary of data, most variables are anaoymized, we don't know the actual meaning of these variables, so it's impossible to check if their ranges are reasonable. However, there are still some problem we need to fix in the data.
+  
+  * code: should be a categorical variable but not int
+  
+  * b00: some entries are with "$" and some are not, the format is not consistent, and it also should be numeric variable not factor. 
+  
+  * b34: this variable is "weekday", but there are spelling mistakes and inconsistencies. eg. ”Mon" and "mon." all stands for Monday. And it should be a factor.
+  
+  * b35: some entries are with "%" and some are not, the format is not consistent, and it also should be numeric variable not a factor.
+  
+  * b58: this variable is "month", like b34, there are also spelling mistakes and inconsistencies. eg."apr." and "Apr" all stands for April.And it should be a factor.
+  
+  * There are some missing values in b21, b34 and b58 are filled with blank space, they should shown as "NA" to make the level number correct.
+  
+  * The zip code looks wired, some have 4 digitals, some have 5, there are also fake numbers like "0" and "99999".
+  
+  * For the random forest model, we convert the response variable y into a factor
+
+
+## Data cleaning
+
+   We need to fix problems mentioned in the data checking section.
+   
+### Drop or keep the "zip" variable
+
+```{r}
+## check wrong zip code 
+sum(str_length(learn$zip)!=5)
+sum(learn$zip==99999)
+length(unique(learn$zip))
+```
+
+  we can see that about 18% zip data are wrong or problemic, and there are 10214 levels, we have resson to believe that it's not a infoamative indicator for prediction, so drop it from the data.
+  
+### The uniformity of b34(weekdays) and b58(monthes)
+
+  Though there are some automatic ways like applying string distance to deal with inconsistent text data, the performance is not good in this case, since there are limited levels, we decide to unify the spelling manually, and we will make this process as a function so we can also deal with data in testing set simply.
+  
+```{r}
+# build transformation function for weekdays
+fix_weekdays <- function(x){
+    str_replace_all(x,c("mon."="Mon","mon"="Mon","Monday"="Mon","monday"="Mon","Monay"="Mon",
+              "tue"="Tue","Tue."="Tue","Tuesday"="Tue","tuesday"="Tue","tue."="Tue", "Tuey"="Tue","Tueay"="Tue","Tueday"="Tue", "Teusday"="Tue",
+              "Wednesday"="Wed","wednesday"="Wed","wed"="Wed","Wed."="Wed","Wendsday"="Wed"," wendsday"="Wed", "wendsday"="Wed",
+              "thu"="Thu","Thursday"="Thu","thu."="Thu","Thu."="Thu","thurday"="Thu","thursday"="Thu", "Thuay"="Thu","Thuy"="Thu", "Thuday"="Thu",
+              "Friday"="Fri","friday"="Fri","Fri."="Fri","fri."="Fri","fri"="Fri"))
+}
+```
+
+```{r}
+# built transformation function 
+fix_monthes <- function(x){
+   str_replace_all(x,c("apr"="Apr","apr."="Apr","Apr."="Apr","april"="Apr","April"="Apr","Apirl"="Apr","Aprl"="Apr",
+              "aug"="Aug","aug."="Aug","Aug."="Aug","Augest"="Aug","august"="Aug","August"="Aug","Augst"="Aug","Augt"="Aug",
+              "dec"="Dec","dec."="Dec","december"="Dec","December"="Dec","Dec."="Dec",
+              "feb"="Feb","feb."="Feb","Feb."="Feb","february"="Feb","February"="Feb", "Febuary"="Feb","Febary"="Feb", "Febry"="Feb", "Feby" = "Feb",
+              "jan"="Jan","jan."="Jan","Jan."="Jan","Janary"="Jan",
+              "jun"="Jun","Jun."="Jun","june"="Jun","June"="Jun",
+              "jul"="Jul",
+              "mar"="Mar","mar."="Mar","Mar."="Mar","march"="Mar","March"="Mar","Marhc"="Mar", "Marc"="Mar","Marc"="Mar", "Marh"="Mar",
+              "may"="May",
+              "nov"="Nov","nov."="Nov","Nov."="Nov","november"="Nov","November"="Nov", "Novmber"="Nov","Novber"="Nov", "Nover"="Nov", "Novr"="Nov",
+              "oct"="Oct","oct."="Oct","Oct."="Oct","october"="Oct","October"="Oct","Octber"="Oct","Octer"="Oct", "Octr"="Oct",
+              "sep"="Sep","sep."="Sep","Sep."="Sep","sept"="Sep","sept."="Sep","Sept."="Sep","september"="Sep","Sep."="Sep","Sepember"="Sep","Sepber"="Sep","Sepr"="Sep","Sepmber"="Sep","Seper"="Sep"))
+}
+```
+
+### Fix all the problems in a pipeline
+
+  Apply `dplyr` package to build a pipeline to fix all the data cleaning problems. 
+
+```{r}
+learn_new <- learn %>%
+  # convert code to factor
+  mutate(code = as.factor(code)) %>%
+  # remove "$" in b00 and convert to numeric
+  mutate(b00 = as.numeric(gsub("\\$", "", b00))) %>%
+  # remove "%" in b35 and convert to numeric
+  mutate(b35 = as.numeric(gsub("\\%", "", b35))) %>%
+  # fix weekdays and convert to factor
+  mutate(b34 = as.factor(fix_weekdays(b34))) %>%
+  # fix monthes and convert to factor
+  mutate(b58 = as.factor(fix_monthes(b58))) %>%
+  # convert y to factor
+  mutate(y = as.factor(y)) %>%
+  # drop the zip variable
+  select(-zip)
+```
+
+  Check the structure of the new data.
+```{r}
+str(learn_new)
+```
+
+### Deal with missing data
+
+```{r}
+# check the summary of missing data
+miss_var_summary(learn_new)
+```
+
+```{r}
+gg_miss_var(learn_new)
+```
+  
+  From the the plot, it looks that the missing occurs randomly, but we still need take a closer look.
+
+
+```{r}
+## drop all rows with NA
+learn_clean <- learn_new %>%
+  na.omit() 
+
+dim(learn_clean)
+
+learn_missing <- learn_new %>%
+  anti_join(learn_clean, by = "id")
+
+dim(learn_missing)
+``` 
+
+
+```{r}
+t.test(as.numeric(learn_clean$y),as.numeric(learn_missing$y))
+```
+  the t-test shows that p-value = 0.7863, which means that the response value does not show any difference in complete set and missing set, we believe that the the data is Missing completely at random (MCAR), so simply drop rows with missing values. which is learn_clean.
+
+
+```{r}
+## make id as rownames
+learn_clean <- data.frame(learn_clean[,-1], row.names= learn_clean[,1])
+```
+  
+  For now, the data cleaning process is almost completed, we can check the data structure again and make sure all the problems has been fixed.
+  
+```{r}
+str(learn_clean)
+```
+
+
+### Split learning data into training and testing dataset
+
+  Though we do not know the value of response variable in the true testing dataset, we can still evaluate the performance of the model by splitting the learning data into training and testing part, first built som prototype models with training data, then test their performances with testing data, select the most powerful model, finally, use the learning data  to produce the final model.
+  
+  One thing needs to be noted is that random forest package has built in function to calculate the OOB error which can be taken as a metric to evaluate the performance of the model. However, in this project we need to compare the performance of two different models, creating a testing data set is necessary for comparison.
+
+```{r}
+## creat train and test data
+# Total number of rows in the data frame
+n <- nrow(learn_clean)
+
+# Number of rows for the training set (75% of the dataset)
+n_train <- round(0.75 * n) 
+
+# Create a vector of indices which is an 75% random sample
+set.seed(123)
+train_indices <- sample(1:n, n_train)
+
+# Subset the credit data frame to training indices only
+learn_train <- learn_clean[train_indices, ]
+learn_train2 <- learn_train %>%
+  mutate(y = as.numeric(as.character(y)))
+  
+# Exclude the training indices to create the test set
+learn_test <- learn_clean[-train_indices, ]
+learn_test2 <- learn_test %>%
+  mutate(y = as.numeric(as.character(y)))
+```
+
+```{r}
+dim(learn_train)
+dim(learn_test)
+```
+
+  We have 7820 observations in the training data and 2606 observations in the testing data.
+
+### Clean prediction dataset 
+
+```{r}
+## join tables
+predict <- a_predict %>%
+  inner_join(b_predict, by = "id")
+```
+
+
+```{r}
+# clean the data
+predict_new <- predict %>%
+  # convert code to factor
+  mutate(code = as.factor(code)) %>%
+  # remove "$" in b00 and convert to numeric
+  mutate(b00 = as.numeric(gsub("\\$", "", b00))) %>%
+  # remove "%" in b35 and convert to numeric
+  mutate(b35 = as.numeric(gsub("\\%", "", b35))) %>%
+  # fix weekdays and convert to factor
+  mutate(b34 = as.factor(fix_weekdays(b34))) %>%
+  # fix monthes and convert to factor
+  mutate(b58 = as.factor(fix_monthes(b58))) %>%
+  # drop the zip variable
+  select(-zip)
+```
+
+
+### fix NAs in the predict data
+  
+  Instead of removing the missing data, we impute the NAs as means. 
+```{r}
+predict_clean <- na.roughfix(predict_new)
+## make id as rownames
+predict_clean <- data.frame(predict_clean[,-1], row.names= predict_clean[,1])
+```
+
+
+## Data exploration
+
+### Check the distribution of "1"s in character variables.
+
+ In this data set, we only know the meaning of 4 character variables, which are weekdays, months, regions and codes, we want to check if "1"s are randomly distributed in these variables or they concentrated in some ones.
+
+```{r}
+# Define by_code
+by_weekdays <- learn_clean %>%
+  group_by(b34) %>%
+  summarize(postive = n()* mean(y == 1))
+ 
+# Create bar plot
+ggplot(by_weekdays, aes(x = b34, y = postive, group = 1)) +
+  geom_col() + 
+  labs(title="Number of postive obs across weekdays")
+
+ggplot(learn_clean, aes(x = b34)) + 
+  geom_bar() +
+  labs(title="Number of total obs across weekdays")
+```
+
+```{r}
+# Define by_code
+by_monthes <- learn_clean %>%
+  group_by(b58) %>%
+  summarize(postive = n()* mean(y == 1))
+
+
+# Create bar plot
+ggplot(by_monthes, aes(x = b58, y = postive, group = 1)) +
+  geom_col() +
+  labs(title="Number of postive obs across monthes")
+
+ggplot(learn_clean, aes(x = b58)) + 
+  geom_bar()+
+  labs(title="Number of postive obs across monthes")
+```
+
+```{r}
+# Define by_code
+by_code <- learn_clean %>%
+  group_by(code) %>%
+  summarize(postive = n()* mean(y == 1))
+  
+
+# Create bar plot
+ggplot(by_code, aes(x = code, y = postive, group = 1)) +
+  geom_col() +
+  labs(title="Number of postive obs across codes")
+
+ggplot(learn_clean, aes(x = code)) + 
+  geom_bar() +
+  labs(title="Number of postive obs across codes")
+```
+
+```{r}
+# Define by_region
+by_region <- learn_clean %>%
+  group_by(b21) %>%
+  summarize(postive = n()* mean(y == 1))
+  
+
+# Create bar plot
+ggplot(by_region, aes(x = b21, y = postive, group = 1)) +
+  geom_col()+
+  labs(title="Number of postive obs across regions")
+
+ggplot(learn_clean, aes(x = b21)) + 
+  geom_bar()+
+  labs(title="Number of postive obs across regions")
+```
+
+  From the plot we can say that positive obs are randomly and proportionally distributed across character variables.
+
+### Check the distribution of numeric variables
+
+```{r}
+library(ggfortify)
+ggplot(tidyr::gather(learn_clean[1:12]), aes(value)) + 
+    geom_histogram(bins = 30) + 
+    facet_wrap(~key, scales = 'free_x')
+```
+  
+  we just show the first 12 variables(a00-a11) here, as the plot shows, all the numeric variables are normally distributed.
+
+## Deal with inbalance data
+
+### Imbalanced classes of y
+
+   When checking and cleaning the data, we had already noticed that the class of response variable y is not balance, from the plot, the ratio of "0" and "1" is about 9:1. 
+   
+   Imbalanced class is a common problem in machine learning classification where there is a disproportionate ratio of observations in each class. Class imbalance can be found in many different areas including medical diagnosis, spam filtering, and fraud detection.
+
+```{r}
+barplot(prop.table(table(learn_clean$y)),
+        col = rainbow(2),
+        ylim = c(0, 1),
+        main = "Class Distribution")
+
+```
+
+### Fix the data with inbalanced class
+
+  * Choose the proper metrics for evaluatiing the model
+  
+    We know that standered metrics like accuravy and error do not perform well in evaluatiing model performance at imbllance data. There are some candidates like AUC/ROC, F1 score, Recal and Precision can be used for this purpose. One important reference is the purpose of the project, that's something that we are not clear here, is the positive class more important? Or both classes are important? Since the instruction says the assessment metric for these models is ROC/AUC, We will take AUC as main matric, but we will also consider other matrics like F1 score and Precision.
+    
+  * Apply oversampling techniques balance the data
+  
+    Oversampling can be defined as adding more copies of the minority class. We will use the `ROSE` package in R to randomly replicate samples from the minority class. there are 4 methods for this resample procedure, "over", "under", "both" and ROSE, we will try all of them and see which one give the best performance
+
+```{r}
+library(ROSE) 
+over <- ovun.sample(y~., data = learn_train, method = "over", seed = 101)$data
+table(over$y)
+```
+
+```{r}
+under <- ovun.sample(y~., data = learn_train, method = "under", seed = 102)$data
+table(under$y)
+```
+
+```{r}
+both <- ovun.sample(y~., data=learn_train, method = "both",
+                    p = 0.5,
+                    seed = 103)$data
+table(both$y)
+```
+
+```{r}
+rose <- ROSE(y~., data = learn_train,seed = 104)$data
+table(rose$y)
+```
+
+
+## Modeling
+
+## Part1: tree-based model 
+
+  Tree-based model is always a good choice for solving classification problem, here we firstly use the `random Forest package in R to build a random forest model,we also fix the model with different resampled datasets and see which give the best performance.
+
+```{r}
+# Load the randomForest package
+library(randomForest)
+```
+
+
+```{r}
+## randomForest model with row training data
+forest_model <- randomForest(y ~ ., data = learn_train, ntree = 500)          
+
+## randomForest model with over sampled data
+forest_over <- randomForest(y ~ ., data = over,ntree = 500) 
+```
+```{r}
+## randomForest model with under sampled data
+forest_under <- randomForest(y ~ ., data = under,ntree = 1000, mtry = 12, nodesize = 1,sampsize = 1300)
+```
+
+```{r}
+
+## randomForest model with both sampled data
+forest_both <- randomForest(y ~ ., data = both,ntree = 500) 
+
+## randomForest model with ROSE sampled data
+forest_rose <- randomForest(y ~ ., data = rose,ntree = 1000) 
+```
+
+  check the plot of diferent models and see how OOB eror changes across number of trees
+  
+```{r}
+print(forest_model)
+plot(forest_model)
+legend(x = "right",legend = c( "OOB","0","1" ), fill = 1:3)
+```
+
+```{r}
+print(forest_over)
+plot(forest_over)
+legend(x = "right",legend = c( "OOB","0","1" ),fill = 1:3)
+```
+
+```{r}
+print(forest_under)
+plot(forest_under)
+legend(x = "right",legend = c( "OOB","0","1" ),fill = 1:3)
+```
+
+```{r}
+print(forest_both)
+plot(forest_both)
+legend(x = "right",legend = c( "OOB","0","1" ),fill = 1:3)
+```
+
+```{r}
+print(forest_rose)
+plot(forest_rose)
+legend(x = "right", 
+       legend = c( "OOB","0","1" ),fill = 1:3)
+```
+
+  use the r package `caret` to creat the confusion Matrix of these models.
+```{r}
+# load caret package
+library(caret)
+
+# Confusion Matrix and Statistics of forest_model
+confusionMatrix(predict(forest_model, learn_test), learn_test$y, positive = '1')
+```
+
+  This model fitted with raw training data has very high  Specificity but very low Sensitivity, since the data is severely imbalanced, this result is not surprising，but if we were interested in predicting, "1"s, this model is not useful, though the total accuracy is 95%, the balanced accuracy is only 0.510949, this is an example of how imbalanced data influence the model evaluation.
+  
+```{r}
+# Confusion Matrix and Statistics of forest_over
+confusionMatrix(predict(forest_over, learn_test), learn_test$y, positive = '1')
+```
+  
+  The Sensitivity is also low in this model, it looks like oversampling make the model over fitted. Balanced accuracy is only 0.510949.
+  
+```{r}
+# Confusion Matrix and Statistics of forest_under
+confusionMatrix(predict(forest_under, learn_test), learn_test$y, positive = '1')
+```
+
+  Sensitivity and specificity are both improved, Balanced Accuracy is 0.886, it seems this model performs better than previous ones.
+  
+```{r}
+confusionMatrix(predict(forest_both, learn_test), learn_test$y, positive = '1')
+```
+ 
+  Balanced Accuracy is only 0.60681, which is lower than the under moedl.
+  
+```{r}
+confusionMatrix(predict(forest_rose, learn_test), learn_test$y, positive = '1')
+```
+ 
+  the Sensitivity and Specificity are fairly high, and the Balanced Accuracy is 0.86, almost the same as under.
+ 
+  
+### Plot the ROC curve of different models.
+
+  Predict the class of y in testing model
+```{r}
+pred_model <- predict(object = forest_model, 
+                  newdata = learn_test,
+                  n.trees = 1000,
+                  type = "prob")
+
+pred_over <- predict(object = forest_over, 
+                  newdata = learn_test,
+                  n.trees = 1000,
+                  type = "prob") 
+
+pred_under <- predict(object = forest_under, 
+                  newdata = learn_test,
+                  n.trees = 1000,
+                  type = "prob") 
+
+pred_both <- predict(object = forest_both, 
+                  newdata = learn_test,
+                  n.trees = 1000,
+                  type = "prob") 
+
+pred_rose <- predict(object = forest_rose, 
+                  newdata = learn_test,
+                  n.trees = 1000,
+                  type = "prob")  
+```
+  
+  Use R package `ROCR` to plot ROC curve in one graph and compare their performance.
+
+```{r}
+library(ROCR)
+# List of predictions
+preds_list <- list(pred_model[,2], pred_over[,2], pred_under[,2],pred_both[,2], pred_rose[,2])
+
+# List of actual values (same for all)
+m <- length(preds_list)
+actuals_list <- rep(list(learn_test2$y), m)
+
+# Plot the ROC curves
+pred <- prediction(preds_list, actuals_list)
+rocs <- performance(pred, "tpr", "fpr")
+
+plot(rocs, col = as.list(1:m), main = "Test Set ROC Curves",lwd = 1)
+legend(x = "bottomright", 
+       legend = c("Train   92.7%", "Over    96.1%", "Under 95.1%", "Both     95.6%","ROSE  93.5%"),
+       fill = 1:m)
+```
+ 
+  Based on the confusion matrix and AUC, we can see all the resample strategies result in improved performance, three models with AUC over 95% are "over", "under" and "both,” "over" and "both" shows extremely good performance in the training data but do not perform so well in the testing data，especially at the performance in predicting, "1"s correctly. Here we make a assumption that we are more interested in predicting "1"s, given that "under" model has the highest balanced accuracy and fairly high AUC, we will adopt under sampling for the data.
+
+  
+### build model with true learning data
+
+```{r}
+## take under sample data
+rf_data <- ovun.sample(y~., data = learn_clean, method = "under", seed = 357)$data
+```
+```{r}
+## fit the random forest data
+rf_model <- randomForest(y ~ ., data = rf_data, ntree = 1000)
+
+## print the model
+print(rf_model)
+```
+
+### Make predictions with the random forest model
+
+```{r}
+## make predictions
+predict_clean$prediction <- predict(object = rf_model, 
+                   newdata = predict_clean,
+                   n.trees = 1000,
+                   type = "prob") [,2]
+```
+
+```{r}
+## perduce the final result
+rf_final <- predict_clean %>%
+  tibble::rownames_to_column("id") %>%
+  select("id","prediction")
+  #write.csv("predictions_QiweiMen_model1.csv",row.names = FALSE)
+```
+
+
+
+## Part2: Logistic Regression Model
+
+  The second model I want to build is logistic regression model, which is a sample but powerful tool for binary classification problem. 
+  
+
+### feature selection
+
+  There are 78 variables in this dataset, some of them are useless for prediction, the first step is proper features for the model, here we use the `stepwise` function to select features.
+  
+  fit the model with the raw data
+
+```{r}
+# build a null model
+fit0 <- glm(y~1, family = binomial(), data = learn_train)
+
+# build a full model include all features
+fitfull <- glm(y~., family = binomial(),data = learn_train)
+
+# conduct feature selection
+#fit_aic <- step(fit0,scope=list(upper=fitfull),data = learn_train, direction = "both",k = 2,trace = 0)
+fit_aic <- glm(formula = y ~ b49 + b00 + b53 + b12 + a01 + b01 + b18 + a00 + b45 + a16 + b41 + b48 + b05 + b19 + a10 + b28 + a04 + b58 + b22 + b52 + a02 + a06 + b33 + b38 + b20 + b50 + b25 + b03 + 
+a15 + b34 + b35 + b42 + b51 + b40 + b15 + b10 + b37 + b07 + b17 + b44 + a14 + b54 + b55, family = binomial(), data = learn_train)
+```
+
+  fit the model with resampled data
+```{r}
+# build a null model
+fit0_rose <- glm(y~1, family = binomial(), data = rose)
+
+# build a full model include all features
+fitfull_rose <- glm(y~., family = binomial(),data = rose)
+
+# select feature
+#fit_rose <- step(fit0_rose,scope=list(upper=fitfull_rose),data = rose, direction = "both",k = 2,trace = 0)
+
+fit_rose <- glm(formula = y ~ b49 + b53 + b00 + b45 + b12 + a00 + b01 + b18 + a05 + b04 + b58 + b42 + b41 + b37 + a16 + b19 + b34 + a04 + b05 + a01 + b35 + a15 + b20 + b15 + a08 + code + b10 + b21 + b28 + a10 + b46 + b38 + b16 + b30 + b50 + b26 + b44 + b54 + a11 + b09 + a14 + b32 + a12 + a02 + a07 + b27 + a13 + b25 + a03 + b29 + b56 + b52, family = binomial(), data = rose)
+```
+
+  
+```{r}
+summary(fit_aic)
+summary(fit_rose)
+```
+
+  
+  make prediction on the testing data with both models
+  
+```{r}
+learn_test3 <- learn_test2 %>%
+  filter(code != 1000004)
+lr_predict <- predict(fit_aic, learn_test3, type = "response")
+lr_predict_rose <-  predict(fit_rose, learn_test3, type = "response")
+```
+
+  Plot ROC and AUC
+
+```{r}
+par(pty = "s")
+ROC_lr <- roc(learn_test3$y, lr_predict, plot = TRUE,legacy.axes=TRUE ,percent = TRUE,print.auc = TRUE, col="#377eb8", lwd = 4)
+
+ROC_lr_rose <- roc(learn_test3$y, lr_predict_rose, plot = TRUE,legacy.axes=TRUE ,percent = TRUE,print.auc = TRUE, col="#377eb8", lwd = 4)
+```
+
+  The AUC of these two models are very close, which means that the resampling doesn't improve the overall performance of the model too much, However,the resampling model gives a more balanced performance in sensitivity and specificity, this is also indicated in the confusion matrix, the resampled model has s slightly higher Balanced Accuracy,so we decided to go with the second method.
+  
+```{r}
+# Confusion Matrix 
+yhat_lr <- as.factor(ifelse(lr_predict > 0.5,1,0)) 
+confusionMatrix(yhat_lr, as.factor(learn_test3$y), positive = '1')
+```
+
+```{r}
+# Confusion Matrix 
+yhat_rose <- as.factor(ifelse(lr_predict_rose > 0.5,1,0)) 
+confusionMatrix(yhat_rose, as.factor(learn_test3$y), positive = '1')
+```
+
+### build model with learning data
+
+```{r}
+predict_rose <- ROSE(y~., data = learn_clean,seed = 105)$data
+```
+```{r}
+# build a null model
+lr_model_final <- glm(formula = 
+    y ~ b49 + b53 + b00 + b45 + b12 + a00 + b01 + b18 + 
+    a05 + b04 + b58 + b42 + b41 + b37 + a16 + b19 + b34 + a04 + 
+    b05 + a01 + b35 + a15 + b20 + b15 + a08 + code + b10 + b21 + 
+    b28 + a10 + b46 + b38 + b16 + b30 + b50 + b26 + b44 + b54 + 
+    a11 + b09 + a14 + b32 + a12 + a02 + a07 + b27 + a13 + b25 + 
+    a03 + b29 + b56 + b52, family = binomial(), data = predict_rose)
+```
+```{r}
+predict_clean2 <- subset(predict_clean, select = -prediction )
+## make predictions
+predict_clean2$prediction <- predict(object = lr_model_final, 
+                 newdata = predict_clean2,
+                 type = "response")
+```
+```{r}
+## perduce the final result
+lr_final <- predict_clean2 %>%
+  tibble::rownames_to_column("id") %>%
+  select("id","prediction") 
+  #write.csv("predictions_QiweiMen_model2.csv",row.names = FALSE)
+```
+
+
+## Summarize of questions mentioned in the instruction: 
+
+* How did you handle the class imbalance? 
+
+  Firstly, I Choose a proper metrics like AUC and Balanced Accuracy to evaluate the performance of the data.
+  
+  Secondly, I apply some  resampleing techniques like over-samples, under-sample and Randomly Over-Sample to fix the imbalanced data.
+
+
+* Had a metric not been imposed, what metric(s) would you have considered using for this model? Why?
+
+  I would like to choose the Balanced Accuracy as the metric, since we don't know the purpose of this project, maybe we interested in predicting 0s, or we interested in predicting 1s, though sometimes predicting one class successfully is more important, a balanced model can give a more stable and reliable model. For Example, the 1s in our data is the label of person who has certain diseases, our procedure is a diagnose procedure, a balance model with fairly highly sensitive and specificity means it has low Misdiagnosis rates and low missed diagnosis rate. So when I have to choose a model, if they have similar AUC, I would choose the one with higher Balanced Accuracy. 
+
+
+* What modeling choices were impacted by scale? Put otherwise, if the learning set’s sample size had been (i) 20 times greater or (ii) 20 times smaller, briefly describe high-level changes in approach you might have considered.
+
+  In my opinion, the performance of tree-based model like random forest will be improved gradually with the growth of sample size, since with more observations, we can build more complex trees and find subtle patterns. 
+
+  The situation for logistic regression is more complicated, on the one hand, a sample has to be large enough to cover the variability of features within the study area, and to yield stable and reproducible results; on the other hand, the sample must not be too large, because a large sample is likely to violate the assumption of independent observations, also as the growth of sample size, the accuracy of the model will not improve too much.
+  
+  If I have a 20 times greater dataset, I would not consider methods like logistic regression, because the sample is too large and with 78 variables, the feature selection will be tedious. A tree-based model will be more proper.
+  
+  If I have a 20 times smaller data(about 600), random forest will not be a good choice, since the small sample size will limit the power of random forest to find patterns. As I mentioned, Sample size calculation for logistic regression is a complex problem, but based on the work of Peduzzi et al. (1996). Let p be the smallest of the proportions of negative or positive cases in the population and k the number of covariates (the number of independent variables), then the minimum number of cases to include is:
+N = 10 k/p. I our case, we have 78 covariates to include in the model and the proportion of positive cases in the population is 0.1 . The minimum number of cases required are:
+
+N = 10 x 78 / 0.20 = 7800 
+
+so logistic regression is not a good choice, we can try other methods like one decision tree, simple Bayesian or KNN.
+
+
+* If data augmentation had been permitted for this project, what data might you have considered incorporating?
+
+  I don't know the actual purpose of this model, and I don't know what features have already been included in the data, so my answer is I don't know, maybe after I know more about this project, I can figure out some potential helpful features.
+
+
+* Given another week to work on this modeling exercise, what would you want to try next towards better understanding this dataset and improving predictive performance?
+
+  I will try model tuning of the random forest data, conduct a grid search on the combination of parameters like ntrees, mtry, nod.size, sample.size.
+  
+  Find a more elegant way to deal with missing data, like conduct imputation using with algorithms.
+  
+  Try other methods like bagging, boosting, simple Bayesian and KNN, compare their performance.
+  
+  Tune the logistic regression in the step selection step, for example, see if the performance will be improved if we add some interaction or quadratic terms.
+  
+  Try to do this project on with Python, because Python have more tools for classification problems.
+
+
+• Compare and contrast both submitted models with regards to strengths, weaknesses, and performance.
+
+  In summary, the random forest model has a better performance between these two models, AUC is about 95%, both sensitivity and specificity are over 85% of the test. The logistic regression model has a lower AUC of 86% which is also a good performance.
+  
+  The strength of random forest model is that it has a very good performance in classification problems, over 95% AUC and fairly high balanced accuracy is amazing. And it's also a very simple model, not too many parameters for tuning, and very friendly for beginners.
+  
+  The weakness of random forest model is that it usually needs large sample size, if we do not have so many obs, it maybe not a
+ good choice. The other weakness is that it's more sensitive to the imbalanced data, if we don't resample the data, the sensitivity is extremely low.
